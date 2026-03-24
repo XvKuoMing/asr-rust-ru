@@ -1,0 +1,13 @@
+[project]
+name = "scripts"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.4.3",
+    "omegaconf>=2.3.0",
+    "packaging>=26.0",
+    "safetensors>=0.7.0",
+    "torch>=2.10.0",
+    "tqdm>=4.67.3",
+]

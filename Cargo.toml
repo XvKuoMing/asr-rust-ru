@@ -1,0 +1,37 @@
+[package]
+name = "asr-rust"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+flash-attn = ["burn_attention"]
+
+[dependencies]
+burn = { version = "0.20.1", features = ["tch"] }
+burn-import = "0.20.1"
+burn_attention = { version = "0.1", features = ["cuda"], optional = true }
+
+actix-web = "4"
+actix-multipart = "0.7"
+tokio = { version = "1", features = ["rt", "sync"] }
+futures = "0.3"
+
+utoipa = { version = "5", features = ["actix_extras"] }
+utoipa-actix-web = "0.1"
+utoipa-swagger-ui = { version = "9", features = ["actix-web"] }
+
+envconfig = "0.11"
+dotenvy = "0.15"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+rustfft = "6"
+tempfile = "3"
+log = "0.4"
+env_logger = "0.11"
+
+[[bench]]
+name = "inference"
+harness = false

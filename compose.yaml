@@ -1,0 +1,28 @@
+services:
+  asr:
+    build: .
+    image: kamasalyamov/asr-rust:latest
+    env_file:
+      - .env
+    environment:
+      - RUST_LOG=info
+      - HOST=${HOST:-0.0.0.0}
+      - PORT=${PORT:-8080}
+      - BATCH_SIZE=${BATCH_SIZE:-16}
+      - BATCH_TIMEOUT_MS=${BATCH_TIMEOUT_MS:-5}
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:${PORT:-8080}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s

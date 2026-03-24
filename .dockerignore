@@ -1,0 +1,9 @@
+target/
+.env
+.venv
+.git/
+.cargo/
+weights/
+GigaAM/
+scripts/.venv
+scripts/__pycache__
