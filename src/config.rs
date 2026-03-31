@@ -16,4 +16,7 @@ pub struct AppConfig {
 
     #[envconfig(from = "WEIGHTS_DIR", default = "weights")]
     pub weights_dir: String,
+
+    #[envconfig(from = "MAX_BATCH_VRAM_MB", default = "512")]
+    pub max_batch_vram_mb: usize,
 }
