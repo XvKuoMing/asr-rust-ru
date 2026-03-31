@@ -1,6 +1,6 @@
 [package]
 name = "asr-rust"
-version = "0.1.1"
+version = "0.1.0"
 edition = "2021"
 
 [features]
@@ -10,7 +10,6 @@ flash-attn = ["burn_attention"]
 [dependencies]
 burn = { version = "0.20.1", features = ["tch"] }
 burn-import = "0.20.1"
-candle-core = "=0.8.4"
 burn_attention = { version = "0.1", features = ["cuda"], optional = true }
 
 actix-web = "4"
