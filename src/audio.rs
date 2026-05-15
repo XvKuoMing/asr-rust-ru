@@ -9,6 +9,16 @@ const HOP_LENGTH: usize = 160;
 const N_MELS: usize = 64;
 const CENTER: bool = false;
 
+/// Decode a slice of little-endian signed 16-bit PCM samples to normalized f32.
+///
+/// The input length must be even (each sample is 2 bytes). Odd trailing bytes
+/// are dropped. Output range is [-1.0, 1.0).
+pub fn pcm16_le_to_f32(pcm: &[u8]) -> Vec<f32> {
+    pcm.chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+        .collect()
+}
+
 pub fn load_wav(path: &str) -> Vec<f32> {
     // Use ffmpeg to decode + resample to 16kHz mono s16le, matching Python's load_audio
     let output = std::process::Command::new("ffmpeg")

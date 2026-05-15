@@ -104,6 +104,99 @@ impl CpuRnntDecoder {
         self.decode_inner(enc_proj, seq_len, tokenizer, |_, _| {})
     }
 
+    /// Run decoding and additionally compute a "speech probability" metric.
+    ///
+    /// Returns `(text, token_confidence, speech_prob)`:
+    /// - `token_confidence`: mean softmax probability of every emitted non-blank
+    ///   token (NaN→0.0 when no tokens were emitted).
+    /// - `speech_prob`: mean `1 - P(blank)` across every encoder frame in the
+    ///   chunk — usable directly as a VAD signal (close to 0 on silence, close
+    ///   to 1 on confident speech).
+    pub fn decode_with_probability(
+        &self,
+        enc_proj: &[f32],
+        seq_len: usize,
+        tokenizer: &Tokenizer,
+    ) -> (String, f32, f32) {
+        let jh = self.joint_hidden;
+        let ph = self.pred_hidden;
+
+        let mut hyp: Vec<usize> = Vec::new();
+        let mut h = vec![0.0f32; ph];
+        let mut c = vec![0.0f32; ph];
+        let mut last_label: Option<usize> = None;
+
+        let mut emb = vec![0.0f32; ph];
+        let mut gates = vec![0.0f32; 4 * ph];
+        let mut h_new = vec![0.0f32; ph];
+        let mut c_new = vec![0.0f32; ph];
+        let mut pred_proj = vec![0.0f32; jh];
+        let mut combined = vec![0.0f32; jh];
+        let mut logits = vec![0.0f32; self.num_classes];
+        let mut probs = vec![0.0f32; self.num_classes];
+
+        let mut token_prob_sum: f32 = 0.0;
+        let mut token_count: usize = 0;
+        let mut nonblank_mass_sum: f32 = 0.0;
+        let mut frame_count: usize = 0;
+
+        for t in 0..seq_len {
+            let f_proj = &enc_proj[t * jh..(t + 1) * jh];
+            let mut not_blank = true;
+            let mut symbols = 0usize;
+            let mut blank_recorded_this_frame = false;
+
+            while not_blank && symbols < MAX_SYMBOLS_PER_STEP {
+                match last_label {
+                    Some(id) => emb.copy_from_slice(&self.embed[id * ph..(id + 1) * ph]),
+                    None => emb.iter_mut().for_each(|v| *v = 0.0),
+                }
+
+                self.lstm_cell(&emb, &h, &c, &mut gates, &mut h_new, &mut c_new);
+                matvec_row(&self.pred_w, &self.pred_b, &h_new, &mut pred_proj, ph, jh);
+
+                for i in 0..jh {
+                    combined[i] = (f_proj[i] + pred_proj[i]).max(0.0);
+                }
+
+                matvec_row(&self.out_w, &self.out_b, &combined, &mut logits, jh, self.num_classes);
+                softmax(&logits, &mut probs);
+                let k = argmax(&logits);
+
+                if !blank_recorded_this_frame {
+                    nonblank_mass_sum += 1.0 - probs[self.blank_id];
+                    frame_count += 1;
+                    blank_recorded_this_frame = true;
+                }
+
+                if k == self.blank_id {
+                    not_blank = false;
+                } else {
+                    h.copy_from_slice(&h_new);
+                    c.copy_from_slice(&c_new);
+                    hyp.push(k);
+                    last_label = Some(k);
+                    token_prob_sum += probs[k];
+                    token_count += 1;
+                    symbols += 1;
+                }
+            }
+        }
+
+        let text = tokenizer.decode(&hyp);
+        let token_confidence = if token_count > 0 {
+            token_prob_sum / token_count as f32
+        } else {
+            0.0
+        };
+        let speech_prob = if frame_count > 0 {
+            nonblank_mass_sum / frame_count as f32
+        } else {
+            0.0
+        };
+        (text, token_confidence, speech_prob)
+    }
+
     /// Like [`decode`], but calls `on_token(token_id, text_piece)` for each
     /// emitted token — suitable for SSE streaming.
     pub fn decode_streaming<F>(
@@ -272,6 +365,27 @@ pub fn precompute_enc_proj_batch<B: Backend>(
 #[inline]
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
+}
+
+/// Numerically stable softmax — writes probabilities into `out`.
+#[inline]
+fn softmax(logits: &[f32], out: &mut [f32]) {
+    let mut max_v = logits[0];
+    for &v in &logits[1..] {
+        if v > max_v {
+            max_v = v;
+        }
+    }
+    let mut sum = 0.0f32;
+    for (i, &v) in logits.iter().enumerate() {
+        let e = (v - max_v).exp();
+        out[i] = e;
+        sum += e;
+    }
+    let inv = 1.0 / sum;
+    for v in out.iter_mut() {
+        *v *= inv;
+    }
 }
 
 /// Cache-friendly row-major matvec: out = bias + input @ W

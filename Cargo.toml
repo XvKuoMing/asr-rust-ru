@@ -14,8 +14,12 @@ burn_attention = { version = "0.1", features = ["cuda"], optional = true }
 
 actix-web = "4"
 actix-multipart = "0.7"
+actix-ws = "0.3"
 tokio = { version = "1", features = ["rt", "sync"] }
+tokio-stream = "0.1"
 futures = "0.3"
+futures-util = "0.3"
+base64 = "0.22"
 
 utoipa = { version = "5", features = ["actix_extras"] }
 utoipa-actix-web = "0.1"

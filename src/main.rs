@@ -1,10 +1,13 @@
 use actix_multipart::Multipart;
-use actix_web::{web, App, HttpResponse, HttpServer};
+use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
+use base64::Engine as _;
 use burn::backend::libtorch::LibTorchDevice;
 use burn::backend::LibTorch;
 use burn::tensor::{Tensor, TensorData};
 use envconfig::Envconfig;
 use futures::TryStreamExt;
+use futures_util::StreamExt;
+use serde::Deserialize;
 use std::io::Write;
 use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
@@ -436,6 +439,321 @@ async fn handle_streaming(
 }
 
 // ---------------------------------------------------------------------------
+// GET /v1/audio/transcriptions/ws — streaming WebSocket transcription
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct WsQuery {
+    /// Input sample rate for the PCM16 stream. Defaults to 16000 Hz.
+    sample_rate: Option<u32>,
+}
+
+struct WsTranscribe {
+    text: String,
+    token_confidence: f32,
+    speech_prob: f32,
+    samples: usize,
+    preprocess_ms: f64,
+    queue_ms: f64,
+    encoder_ms: f64,
+    decode_ms: f64,
+    batch_size: usize,
+}
+
+/// Run encoder + RNNT decode on a single contiguous audio buffer.
+async fn transcribe_buffer(
+    state: &web::Data<AppState>,
+    samples: Vec<f32>,
+) -> Result<WsTranscribe, String> {
+    let num_samples = samples.len();
+    if num_samples < audio::SAMPLE_RATE / 25 {
+        // < 40 ms — not enough for a single mel frame; treat as silence.
+        return Ok(WsTranscribe {
+            text: String::new(),
+            token_confidence: 0.0,
+            speech_prob: 0.0,
+            samples: num_samples,
+            preprocess_ms: 0.0,
+            queue_ms: 0.0,
+            encoder_ms: 0.0,
+            decode_ms: 0.0,
+            batch_size: 0,
+        });
+    }
+
+    let state_clone = state.clone();
+
+    let t_pre = Instant::now();
+    let (mel, n_mels, n_frames) = web::block(move || {
+        let mel = audio::extract_mel_spectrogram(&samples);
+        let (n_mels, n_frames) = audio::mel_spectrogram_shape(samples.len());
+        (mel, n_mels, n_frames)
+    })
+    .await
+    .map_err(|e| format!("preprocess error: {e}"))?;
+    let preprocess_ms = t_pre.elapsed().as_secs_f64() * 1000.0;
+
+    if n_frames == 0 {
+        return Ok(WsTranscribe {
+            text: String::new(),
+            token_confidence: 0.0,
+            speech_prob: 0.0,
+            samples: num_samples,
+            preprocess_ms,
+            queue_ms: 0.0,
+            encoder_ms: 0.0,
+            decode_ms: 0.0,
+            batch_size: 0,
+        });
+    }
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    state_clone
+        .encoder_tx
+        .send(EncoderRequest {
+            mel,
+            n_mels,
+            n_frames,
+            submitted_at: Instant::now(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "batch engine unavailable".to_string())?;
+
+    let enc = reply_rx
+        .await
+        .map_err(|_| "batch engine error".to_string())?;
+
+    let state_clone = state_clone.clone();
+    let t_dec = Instant::now();
+    let (text, token_conf, speech_prob) = web::block(move || {
+        state_clone.cpu_decoder.decode_with_probability(
+            &enc.enc_proj,
+            enc.seq_len,
+            &state_clone.tokenizer,
+        )
+    })
+    .await
+    .map_err(|e| format!("decode error: {e}"))?;
+    let decode_ms = t_dec.elapsed().as_secs_f64() * 1000.0;
+
+    Ok(WsTranscribe {
+        text,
+        token_confidence: token_conf,
+        speech_prob,
+        samples: num_samples,
+        preprocess_ms,
+        queue_ms: enc.queue_ms,
+        encoder_ms: enc.encoder_ms,
+        decode_ms,
+        batch_size: enc.batch_size,
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/audio/transcriptions/ws",
+    params(
+        ("sample_rate" = Option<u32>, Query, description = "Input PCM16 sample rate (Hz). Default 16000."),
+    ),
+    responses(
+        (status = 101, description = "WebSocket upgrade. See README for the JSON wire protocol."),
+    ),
+    tag = "Audio"
+)]
+async fn transcribe_ws(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    body: web::Payload,
+    query: web::Query<WsQuery>,
+) -> actix_web::Result<HttpResponse> {
+    let peer = req
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "-".into());
+
+    let sample_rate = query.sample_rate.unwrap_or(audio::SAMPLE_RATE as u32);
+    if sample_rate != audio::SAMPLE_RATE as u32 {
+        return Ok(HttpResponse::BadRequest().json(WsErrorResponse {
+            event_type: "error".into(),
+            error: format!(
+                "unsupported sample_rate {sample_rate}: only {} Hz is supported",
+                audio::SAMPLE_RATE
+            ),
+        }));
+    }
+
+    let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body)?;
+    log::info!("{} WS /v1/audio/transcriptions/ws connected", peer);
+
+    actix_web::rt::spawn(async move {
+        let mut buffer: Vec<f32> = Vec::with_capacity(audio::SAMPLE_RATE * 5);
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let peer_log = peer.clone();
+        let mut chunk_idx: usize = 0;
+
+        while let Some(Ok(msg)) = msg_stream.next().await {
+            match msg {
+                actix_ws::Message::Text(text) => {
+                    let chunk: TranscriptionChunkRequest =
+                        match serde_json::from_str(text.as_ref()) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _ = session
+                                    .text(
+                                        serde_json::to_string(&WsErrorResponse {
+                                            event_type: "error".into(),
+                                            error: format!("invalid JSON: {e}"),
+                                        })
+                                        .unwrap(),
+                                    )
+                                    .await;
+                                continue;
+                            }
+                        };
+
+                    let pcm = match b64.decode(chunk.audio.as_bytes()) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = session
+                                .text(
+                                    serde_json::to_string(&WsErrorResponse {
+                                        event_type: "error".into(),
+                                        error: format!("base64 decode error: {e}"),
+                                    })
+                                    .unwrap(),
+                                )
+                                .await;
+                            continue;
+                        }
+                    };
+                    buffer.extend(audio::pcm16_le_to_f32(&pcm));
+
+                    let snapshot = buffer.clone();
+                    let t_req = Instant::now();
+                    let r = match transcribe_buffer(&state, snapshot).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = session
+                                .text(
+                                    serde_json::to_string(&WsErrorResponse {
+                                        event_type: "error".into(),
+                                        error: e,
+                                    })
+                                    .unwrap(),
+                                )
+                                .await;
+                            continue;
+                        }
+                    };
+                    let total_ms = t_req.elapsed().as_secs_f64() * 1000.0;
+                    let audio_s = r.samples as f64 / audio::SAMPLE_RATE as f64;
+                    let rtf = if audio_s > 0.0 { (total_ms / 1000.0) / audio_s } else { 0.0 };
+                    log::info!(
+                        "{} WS chunk={} {}ms [audio={:.2}s preprocess={:.0}ms \
+                         queue={:.0}ms encoder={:.0}ms decode={:.0}ms batch={} \
+                         speech_prob={:.3} token_conf={:.3} chars={} rtf={:.4}x] final={}",
+                        peer,
+                        chunk_idx,
+                        total_ms as u64,
+                        audio_s,
+                        r.preprocess_ms,
+                        r.queue_ms,
+                        r.encoder_ms,
+                        r.decode_ms,
+                        r.batch_size,
+                        r.speech_prob,
+                        r.token_confidence,
+                        r.text.chars().count(),
+                        rtf,
+                        chunk.r#final,
+                    );
+
+                    let event_type = if chunk.r#final { "final" } else { "delta" };
+                    let resp = TranscriptionChunkResponse {
+                        event_type: event_type.into(),
+                        text: r.text,
+                        token_confidence: r.token_confidence,
+                        speech_prob: r.speech_prob,
+                        samples: r.samples,
+                    };
+                    if session.text(serde_json::to_string(&resp).unwrap()).await.is_err() {
+                        break;
+                    }
+                    if chunk.r#final {
+                        buffer.clear();
+                    }
+                    chunk_idx += 1;
+                }
+                actix_ws::Message::Binary(bin) => {
+                    buffer.extend(audio::pcm16_le_to_f32(&bin));
+                    let snapshot = buffer.clone();
+                    let t_req = Instant::now();
+                    let r = match transcribe_buffer(&state, snapshot).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = session
+                                .text(
+                                    serde_json::to_string(&WsErrorResponse {
+                                        event_type: "error".into(),
+                                        error: e,
+                                    })
+                                    .unwrap(),
+                                )
+                                .await;
+                            continue;
+                        }
+                    };
+                    let total_ms = t_req.elapsed().as_secs_f64() * 1000.0;
+                    let audio_s = r.samples as f64 / audio::SAMPLE_RATE as f64;
+                    let rtf = if audio_s > 0.0 { (total_ms / 1000.0) / audio_s } else { 0.0 };
+                    log::info!(
+                        "{} WS chunk={} {}ms [audio={:.2}s preprocess={:.0}ms \
+                         queue={:.0}ms encoder={:.0}ms decode={:.0}ms batch={} \
+                         speech_prob={:.3} token_conf={:.3} chars={} rtf={:.4}x] binary",
+                        peer,
+                        chunk_idx,
+                        total_ms as u64,
+                        audio_s,
+                        r.preprocess_ms,
+                        r.queue_ms,
+                        r.encoder_ms,
+                        r.decode_ms,
+                        r.batch_size,
+                        r.speech_prob,
+                        r.token_confidence,
+                        r.text.chars().count(),
+                        rtf,
+                    );
+                    let resp = TranscriptionChunkResponse {
+                        event_type: "delta".into(),
+                        text: r.text,
+                        token_confidence: r.token_confidence,
+                        speech_prob: r.speech_prob,
+                        samples: r.samples,
+                    };
+                    if session.text(serde_json::to_string(&resp).unwrap()).await.is_err() {
+                        break;
+                    }
+                    chunk_idx += 1;
+                }
+                actix_ws::Message::Ping(p) => {
+                    let _ = session.pong(&p).await;
+                }
+                actix_ws::Message::Close(reason) => {
+                    let _ = session.close(reason).await;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        log::info!("{} WS closed", peer_log);
+    });
+
+    Ok(response)
+}
+
+// ---------------------------------------------------------------------------
 // GET /health
 // ---------------------------------------------------------------------------
 
@@ -514,7 +832,7 @@ async fn main() -> std::io::Result<()> {
 
     #[derive(OpenApi)]
     #[openapi(
-        paths(transcribe, health),
+        paths(transcribe, transcribe_ws, health),
         components(schemas(
             TranscribeRequest,
             TranscriptionResponse,
@@ -522,6 +840,9 @@ async fn main() -> std::io::Result<()> {
             InputTokenDetails,
             TranscriptTextDelta,
             TranscriptTextDone,
+            TranscriptionChunkRequest,
+            TranscriptionChunkResponse,
+            WsErrorResponse,
             HealthResponse,
         ))
     )]
@@ -531,6 +852,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(state.clone())
             .route("/v1/audio/transcriptions", web::post().to(transcribe))
+            .route("/v1/audio/transcriptions/ws", web::get().to(transcribe_ws))
             .route("/health", web::get().to(health))
             .service(
                 SwaggerUi::new("/docs/{_:.*}")

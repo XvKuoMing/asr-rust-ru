@@ -224,6 +224,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "actix-ws"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12d4f2fbee3ef7a22fa6cb0e416b962237a167ed0419f22d4e451da2d7f082f8"
+dependencies = [
+ "actix-codec",
+ "actix-http",
+ "actix-web",
+ "bytestring",
+ "futures-core",
+ "tokio",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -424,6 +438,8 @@ version = "0.1.0"
 dependencies = [
  "actix-multipart",
  "actix-web",
+ "actix-ws",
+ "base64",
  "burn 0.20.1",
  "burn-import",
  "burn_attention",
@@ -431,12 +447,14 @@ dependencies = [
  "env_logger",
  "envconfig",
  "futures",
+ "futures-util",
  "log",
  "rustfft",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "utoipa",
  "utoipa-actix-web",
  "utoipa-swagger-ui",
@@ -7524,6 +7542,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
  "rustls",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-stream"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
  "tokio",
 ]
 
