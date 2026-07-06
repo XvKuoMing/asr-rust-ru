@@ -58,6 +58,13 @@ This creates a `weights/` directory with:
 - `v3_e2e_rnnt_tokenizer.model`
 - `config.json`
 
+`convert_model.py` downloads from the Sber CDN (geo-blocked in some regions).
+To use a **local / fine-tuned** checkpoint instead:
+
+```bash
+uv run python convert_finetuned.py /path/to/your.ckpt /path/to/v3_e2e_rnnt_tokenizer.model ../weights
+```
+
 ### 2. Build
 
 The project uses LibTorch with CUDA. The `.cargo/config.toml` sets
@@ -114,6 +121,17 @@ A `model` name ending in **`-lmcorr`** (e.g. `gigaam-lmcorr`) runs the
 [embedded brand-correction LM](#brand-correction-lm) on the transcript; the
 response then carries the corrected `text` plus the uncorrected `raw_text`.
 Any other (or absent) model name transcribes without correction.
+
+```bash
+curl -F "file=@call.wav" -F "model=gigaam-lmcorr" localhost:8080/v1/audio/transcriptions
+```
+```json
+{
+  "text":     "Доброе утро, компания Водовоз Светлана. Как я могу к вам обращаться?",
+  "raw_text": "Доброе утро, компания Вадова Светлана. Как я могу к вам обращаться?",
+  "usage":    { "...": "..." }
+}
+```
 
 ### `GET /v1/audio/transcriptions/ws` (WebSocket)
 
@@ -222,8 +240,9 @@ this protocol with built-in VAD — see
 
 An embedded fine-tuned **ruT5** rewrites brand names the ASR mis-heard
 (`вотоввос` → `Водовоз`, `сникерс` → `Snickers`, `аквариал` → `Аква Ареал`).
-It runs fully in-process on CPU via [candle](https://github.com/huggingface/candle)
-— no Python, no sidecar. A catalog acceptance filter keeps only edits that turn
+It runs fully in-process via [candle](https://github.com/huggingface/candle)
+— GPU (bf16) with the `corrector-cuda` feature, CPU otherwise; no Python, no
+sidecar. A catalog acceptance filter keeps only edits that turn
 a phonetically-close span into a real catalog brand, so correction can never
 delete content or replace a genuine word.
 
@@ -248,24 +267,28 @@ download, convert it with `scripts/convert_finetuned.py <ckpt> <tokenizer.model>
 If the directory is missing the service runs normally and `-lmcorr` requests
 get HTTP 400.
 
-**Performance.** Correction is *windowed*: a cheap phonetic screen locates
-brand-candidate spans, and only a small window around the best-ranked spans
-(max 2) goes through T5 — latency scales with the window, not the sentence.
-Texts with nothing brand-like skip the LM entirely (<1 ms). Measured with
-`cargo run --release --features corrector-cuda --example corrector_demo`
-(ruT5-base, RTX 5090, WSL2 — native Linux is faster per kernel launch):
+**Performance** (measured end-to-end on an RTX 5090, WSL2, fine-tuned
+weights; native Linux is faster per kernel launch). Correction is *windowed*:
+a non-word screen (`common_words.txt`) finds garble candidates — on real call
+transcripts **~85% of sentences contain none and skip the LM entirely** — and
+only a small window around the best-ranked spans (max 2) goes through T5.
 
-| path | latency |
+| request path | server time |
 |---|---|
-| pre-filter skip (no brand-like span) | < 1 ms |
-| one correction window (GPU, bf16) | ~110–170 ms |
-| two windows (worst case, GPU) | ~200–290 ms |
-| CPU fallback (no `corrector-cuda`) | ~2 s |
+| transcription only (5–7 s audio) | 115–180 ms (RTF ≈ 0.02–0.03×) |
+| + correction, screen-skip (no garble candidates) | +8–30 ms |
+| + correction, one window fixed by the LM | +~130 ms |
+| CPU corrector fallback (no `corrector-cuda`) | +~2 s |
 
-Quality is unchanged by windowing (61.3% vs 61.5% brand-fix on the synthetic
-test, 0.5% false positives, general WER 11.21→11.19). The Docker image builds
-with `corrector-cuda` by default; for a local GPU build you need `nvcc` (CUDA
-12.8+ for Blackwell/sm_120).
+Whole app VRAM: **~2.1 GiB** (fp32 Conformer encoder + LibTorch context +
+bf16 T5 corrector). Quality with windowing + screen on the synthetic
+garbled-brand benchmark: 58.4% fix rate, 0.5% false positives, general val
+WER 11.21 → 11.18 (the corrector strictly helps). Validated on real call
+audio: a garbled company name (`компания Вадова` → `компания Водовоз`) is
+fixed; correct brand mentions and genuine words that merely sound brand-like
+(a real `аквариум`) are never touched. The Docker image builds with
+`corrector-cuda` by default; a local GPU build needs `nvcc` (CUDA 12.8+ for
+Blackwell/sm_120).
 
 ## Short-audio anti-deletion
 
