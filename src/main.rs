@@ -16,7 +16,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use asr_rust::config::AppConfig;
 use asr_rust::schemas::*;
-use asr_rust::{audio, decoding, model};
+use asr_rust::{audio, corrector, decoding, model};
 
 type Backend = LibTorch;
 
@@ -48,6 +48,25 @@ struct AppState {
     encoder_tx: tokio::sync::mpsc::Sender<EncoderRequest>,
     tokenizer: decoding::Tokenizer,
     cpu_decoder: decoding::CpuRnntDecoder,
+    /// Embedded brand-correction LM; `None` when no corrector model directory
+    /// was provided. Mutex because T5 generation mutates its kv-cache.
+    corrector: Option<std::sync::Mutex<corrector::Corrector>>,
+}
+
+impl AppState {
+    /// Does the requested `model` name opt into LM brand correction?
+    fn wants_lmcorr(model: Option<&str>) -> bool {
+        model.map(|m| m.trim().ends_with("-lmcorr")).unwrap_or(false)
+    }
+
+    /// Run brand correction; returns the corrected text, or the input as-is
+    /// if the corrector is unavailable.
+    fn correct(&self, text: &str) -> String {
+        match &self.corrector {
+            Some(c) => c.lock().expect("corrector mutex poisoned").correct(text),
+            None => text.to_string(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +237,7 @@ async fn transcribe(
     // ── Parse multipart fields ──────────────────────────────────────
     let mut audio_bytes: Option<Vec<u8>> = None;
     let mut stream_mode = false;
+    let mut model_name: Option<String> = None;
 
     while let Some(mut field) = payload.try_next().await? {
         let name = field.name().unwrap_or("").to_string();
@@ -231,6 +251,7 @@ async fn transcribe(
                 let val = String::from_utf8_lossy(&buf);
                 stream_mode = matches!(val.trim(), "true" | "True" | "1");
             }
+            "model" => model_name = Some(String::from_utf8_lossy(&buf).trim().to_string()),
             _ => {}
         }
     }
@@ -239,10 +260,19 @@ async fn transcribe(
         audio_bytes.ok_or_else(|| actix_web::error::ErrorBadRequest("missing 'file' field"))?;
     let upload_size = audio_bytes.len();
 
+    let lmcorr = AppState::wants_lmcorr(model_name.as_deref());
+    if lmcorr && state.corrector.is_none() {
+        return Err(actix_web::error::ErrorBadRequest(
+            "model '-lmcorr' requested but no corrector model is loaded \
+             (set CORRECTOR_DIR to a valid model directory)",
+        ));
+    }
+
     log::info!(
-        "{} POST /v1/audio/transcriptions stream={} size={}B",
+        "{} POST /v1/audio/transcriptions stream={} lmcorr={} size={}B",
         peer,
         stream_mode,
+        lmcorr,
         upload_size,
     );
 
@@ -287,7 +317,7 @@ async fn transcribe(
 
     // ── Phase 3: decode ─────────────────────────────────────────────
     if stream_mode {
-        handle_streaming(state, enc, audio_dur_s, preprocess_ms, peer, request_start).await
+        handle_streaming(state, enc, audio_dur_s, preprocess_ms, peer, request_start, lmcorr).await
     } else {
         handle_non_streaming(
             state,
@@ -297,6 +327,7 @@ async fn transcribe(
             n_frames,
             peer,
             request_start,
+            lmcorr,
         )
         .await
     }
@@ -314,6 +345,7 @@ async fn handle_non_streaming(
     n_frames: usize,
     peer: String,
     request_start: Instant,
+    lmcorr: bool,
 ) -> actix_web::Result<HttpResponse> {
     let result = web::block(move || {
         let t = Instant::now();
@@ -322,13 +354,22 @@ async fn handle_non_streaming(
             .decode(&enc.enc_proj, enc.seq_len, &state.tokenizer);
         let decode_ms = t.elapsed().as_secs_f64() * 1000.0;
 
+        let t = Instant::now();
+        let (text, raw_text) = if lmcorr {
+            let corrected = state.correct(&text);
+            (corrected, Some(text))
+        } else {
+            (text, None)
+        };
+        let correct_ms = t.elapsed().as_secs_f64() * 1000.0;
+
         let output_tokens = text.split_whitespace().count();
         let total_ms = request_start.elapsed().as_secs_f64() * 1000.0;
         let rtf = (total_ms / 1000.0) / audio_dur_s;
 
         log::info!(
             "{} 200 {:.0}ms [audio={:.2}s preprocess={:.0}ms queue={:.0}ms \
-             encoder={:.0}ms decode={:.0}ms batch={} tokens={} rtf={:.4}x]",
+             encoder={:.0}ms decode={:.0}ms correct={:.0}ms batch={} tokens={} rtf={:.4}x]",
             peer,
             total_ms,
             audio_dur_s,
@@ -336,6 +377,7 @@ async fn handle_non_streaming(
             enc.queue_ms,
             enc.encoder_ms,
             decode_ms,
+            correct_ms,
             enc.batch_size,
             output_tokens,
             rtf,
@@ -343,6 +385,7 @@ async fn handle_non_streaming(
 
         TranscriptionResponse {
             text,
+            raw_text,
             usage: Usage {
                 usage_type: "tokens".into(),
                 input_tokens: n_frames,
@@ -372,6 +415,7 @@ async fn handle_streaming(
     preprocess_ms: f64,
     peer: String,
     request_start: Instant,
+    lmcorr: bool,
 ) -> actix_web::Result<HttpResponse> {
     log::info!(
         "{} SSE started [audio={:.2}s preprocess={:.0}ms queue={:.0}ms \
@@ -418,9 +462,17 @@ async fn handle_streaming(
             rtf,
         );
 
+        // deltas stream raw for latency; the final text carries the correction
+        let (text, raw_text) = if lmcorr {
+            let corrected = state.correct(&full_text);
+            (corrected, Some(full_text))
+        } else {
+            (full_text, None)
+        };
         let done = TranscriptTextDone {
             event_type: "transcript.text.done".into(),
-            text: full_text,
+            text,
+            raw_text,
         };
         let line = format!("data: {}\n\n", serde_json::to_string(&done).unwrap());
         tx.blocking_send(line).ok();
@@ -446,6 +498,8 @@ async fn handle_streaming(
 struct WsQuery {
     /// Input sample rate for the PCM16 stream. Defaults to 16000 Hz.
     sample_rate: Option<u32>,
+    /// Model name; a `-lmcorr` suffix enables brand correction on finals.
+    model: Option<String>,
 }
 
 struct WsTranscribe {
@@ -587,8 +641,22 @@ async fn transcribe_ws(
         }));
     }
 
+    let lmcorr = AppState::wants_lmcorr(query.model.as_deref());
+    if lmcorr && state.corrector.is_none() {
+        return Ok(HttpResponse::BadRequest().json(WsErrorResponse {
+            event_type: "error".into(),
+            error: "model '-lmcorr' requested but no corrector model is loaded \
+                    (set CORRECTOR_DIR to a valid model directory)"
+                .into(),
+        }));
+    }
+
     let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body)?;
-    log::info!("{} WS /v1/audio/transcriptions/ws connected", peer);
+    log::info!(
+        "{} WS /v1/audio/transcriptions/ws connected lmcorr={}",
+        peer,
+        lmcorr
+    );
 
     actix_web::rt::spawn(async move {
         let mut buffer: Vec<f32> = Vec::with_capacity(audio::SAMPLE_RATE * 5);
@@ -674,9 +742,25 @@ async fn transcribe_ws(
                     );
 
                     let event_type = if chunk.r#final { "final" } else { "delta" };
+                    // correct finals only: deltas stay raw for latency
+                    let (text, raw_text) = if lmcorr && chunk.r#final && !r.text.is_empty() {
+                        let state = state.clone();
+                        let raw = r.text.clone();
+                        let corrected =
+                            web::block(move || state.correct(&raw)).await.unwrap_or_else(
+                                |e| {
+                                    log::warn!("correction task failed: {e}");
+                                    r.text.clone()
+                                },
+                            );
+                        (corrected, Some(r.text))
+                    } else {
+                        (r.text, None)
+                    };
                     let resp = TranscriptionChunkResponse {
                         event_type: event_type.into(),
-                        text: r.text,
+                        text,
+                        raw_text,
                         token_confidence: r.token_confidence,
                         speech_prob: r.speech_prob,
                         peak_speech_prob: r.peak_speech_prob,
@@ -733,6 +817,7 @@ async fn transcribe_ws(
                     let resp = TranscriptionChunkResponse {
                         event_type: "delta".into(),
                         text: r.text,
+                        raw_text: None,
                         token_confidence: r.token_confidence,
                         speech_prob: r.speech_prob,
                         peak_speech_prob: r.peak_speech_prob,
@@ -814,6 +899,33 @@ async fn main() -> std::io::Result<()> {
     let tokenizer = decoding::Tokenizer::load(&tokenizer_path);
     let cpu_decoder = decoding::CpuRnntDecoder::from_model(&model.head, tokenizer.blank_id());
 
+    let corrector = if std::path::Path::new(&config.corrector_dir).is_dir() {
+        match corrector::Corrector::load(&config.corrector_dir) {
+            Ok(c) => {
+                log::info!(
+                    "Brand corrector loaded from {}/ ({} catalog brands) — \
+                     request a model name ending in '-lmcorr' to enable it",
+                    config.corrector_dir,
+                    c.catalog_len(),
+                );
+                Some(std::sync::Mutex::new(c))
+            }
+            Err(e) => {
+                log::error!(
+                    "Brand corrector present at {}/ but failed to load: {e}",
+                    config.corrector_dir
+                );
+                None
+            }
+        }
+    } else {
+        log::info!(
+            "No corrector model at {}/ — '-lmcorr' requests will be rejected",
+            config.corrector_dir
+        );
+        None
+    };
+
     log::info!("Warming up …");
     warmup(&model, &device);
 
@@ -830,6 +942,7 @@ async fn main() -> std::io::Result<()> {
         encoder_tx,
         tokenizer,
         cpu_decoder,
+        corrector,
     });
 
     let bind = (config.host.clone(), config.port);

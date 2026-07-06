@@ -6,3 +6,4 @@ weights/
 GigaAM/
 scripts/.venv
 scripts/__pycache__
+corrector/

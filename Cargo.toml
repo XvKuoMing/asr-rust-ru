@@ -12,6 +12,12 @@ burn = { version = "0.20.1", features = ["tch"] }
 burn-import = "0.20.1"
 burn_attention = { version = "0.1", features = ["cuda"], optional = true }
 
+# embedded brand-correction LM (T5 via candle, CPU)
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+tokenizers = "0.22"
+
 actix-web = "4"
 actix-multipart = "0.7"
 actix-ws = "0.3"

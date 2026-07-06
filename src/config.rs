@@ -17,6 +17,12 @@ pub struct AppConfig {
     #[envconfig(from = "WEIGHTS_DIR", default = "weights")]
     pub weights_dir: String,
 
+    /// Directory with the brand-corrector LM (HF T5 export: model.safetensors,
+    /// config.json, tokenizer.json + brands.txt). If the directory is absent
+    /// the service runs without correction and "-lmcorr" requests are rejected.
+    #[envconfig(from = "CORRECTOR_DIR", default = "corrector")]
+    pub corrector_dir: String,
+
     #[envconfig(from = "MAX_BATCH_VRAM_MB", default = "512")]
     pub max_batch_vram_mb: usize,
 }

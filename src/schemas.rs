@@ -12,7 +12,9 @@ pub struct TranscribeRequest {
     #[schema(format = Binary)]
     pub file: String,
 
-    /// Model identifier — accepted but ignored (only GigaAM available).
+    /// Model identifier. A name ending in `-lmcorr` (e.g. `gigaam-lmcorr`)
+    /// enables the embedded brand-correction LM on the transcript; any other
+    /// (or absent) name transcribes without correction.
     #[schema(default = "gigaam")]
     pub model: Option<String>,
 
@@ -28,6 +30,10 @@ pub struct TranscribeRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TranscriptionResponse {
     pub text: String,
+    /// Uncorrected ASR output; present only when brand correction ran
+    /// (`model` ended in `-lmcorr`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_text: Option<String>,
     pub usage: Usage,
 }
 
@@ -63,6 +69,9 @@ pub struct TranscriptTextDone {
     #[serde(rename = "type")]
     pub event_type: String,
     pub text: String,
+    /// Uncorrected ASR output; present only when brand correction ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_text: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +115,10 @@ pub struct TranscriptionChunkResponse {
     /// Max per-frame `1 − P(blank)` in this chunk. Stays high for brief
     /// speech the mean washes out — prefer this for noise filtering.
     pub peak_speech_prob: f32,
+    /// Uncorrected ASR output; present only on `final` chunks when brand
+    /// correction ran (`model=...-lmcorr` on the URL query).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_text: Option<String>,
     /// Length (in 16 kHz samples) of the audio buffer that produced `text`.
     pub samples: usize,
 }
