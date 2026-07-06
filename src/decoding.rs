@@ -54,6 +54,49 @@ impl Tokenizer {
 // CPU-side RNNT decoder — all weights held as flat f32 arrays
 // ---------------------------------------------------------------------------
 
+/// Short-audio / anti-deletion knobs for greedy RNNT decoding.
+///
+/// RNNT greedy decode collapses a whole utterance to the empty string when the
+/// blank class wins on every encoder frame — the failure mode behind "an
+/// isolated number in a short 8 kHz clip is ignored". These knobs bias the
+/// blank logit down (especially on short clips) and, as a hard backstop, force
+/// a re-decode that emits at least one token whenever the clip actually
+/// contains speech. Genuine silence still decodes to the empty string.
+#[derive(Clone, Copy, Debug)]
+pub struct AntiDeletion {
+    /// Subtracted from the blank logit at every decode step, all utterances.
+    pub blank_penalty: f32,
+    /// Encoder-frame count at/below which a clip is treated as "short".
+    /// GigaAM's encoder emits ~25 frames/s, so 40 ≈ 1.6 s.
+    pub short_frames: usize,
+    /// Extra blank penalty added on top of `blank_penalty` for short clips.
+    pub short_extra_penalty: f32,
+    /// Force at least one emitted token when the clip contains speech.
+    pub guarantee_nonempty: bool,
+    /// VAD gate for the guarantee: only force emission if the peak per-frame
+    /// non-blank probability `max_t (1 - softmax(logits)[blank])` reaches this.
+    /// Pure silence sits near 0; clearly-spoken short clips are well above it.
+    /// It is a precision/recall knob: lower = recover more dropped numbers but
+    /// risk emitting on ambiguous background noise; higher = safer on noise but
+    /// may leave the most degraded numbers empty. Tune with eval_short_audio.py.
+    pub speech_prob_thresh: f32,
+    /// Hard cap on the escalated blank penalty used by the guarantee.
+    pub max_penalty: f32,
+}
+
+impl Default for AntiDeletion {
+    fn default() -> Self {
+        Self {
+            blank_penalty: 0.0,
+            short_frames: 40,
+            short_extra_penalty: 2.5,
+            guarantee_nonempty: true,
+            speech_prob_thresh: 0.2,
+            max_penalty: 15.0,
+        }
+    }
+}
+
 pub struct CpuRnntDecoder {
     embed: Vec<f32>,
     lstm_ih_w: Vec<f32>,
@@ -68,6 +111,7 @@ pub struct CpuRnntDecoder {
     joint_hidden: usize,
     num_classes: usize,
     blank_id: usize,
+    anti_del: AntiDeletion,
 }
 
 impl CpuRnntDecoder {
@@ -94,7 +138,18 @@ impl CpuRnntDecoder {
             embed, lstm_ih_w, lstm_ih_b, lstm_hh_w, lstm_hh_b,
             pred_w, pred_b, out_w, out_b,
             pred_hidden, joint_hidden, num_classes, blank_id,
+            anti_del: AntiDeletion::default(),
         }
+    }
+
+    /// Override the anti-deletion / short-audio decoding knobs.
+    pub fn set_anti_deletion(&mut self, cfg: AntiDeletion) {
+        self.anti_del = cfg;
+    }
+
+    /// Current anti-deletion configuration.
+    pub fn anti_deletion(&self) -> AntiDeletion {
+        self.anti_del
     }
 
     /// Run RNNT greedy decoding entirely on CPU.
@@ -104,20 +159,23 @@ impl CpuRnntDecoder {
         self.decode_inner(enc_proj, seq_len, tokenizer, |_, _| {})
     }
 
-    /// Run decoding and additionally compute a "speech probability" metric.
+    /// Run decoding and additionally compute speech-probability metrics.
     ///
-    /// Returns `(text, token_confidence, speech_prob)`:
+    /// Returns `(text, token_confidence, speech_prob, peak_speech_prob)`:
     /// - `token_confidence`: mean softmax probability of every emitted non-blank
-    ///   token (NaN→0.0 when no tokens were emitted).
+    ///   token (0.0 when no tokens were emitted).
     /// - `speech_prob`: mean `1 - P(blank)` across every encoder frame in the
-    ///   chunk — usable directly as a VAD signal (close to 0 on silence, close
-    ///   to 1 on confident speech).
+    ///   chunk — a VAD signal (close to 0 on silence, close to 1 on speech).
+    ///   Being a MEAN it under-reports short speech: one spoken number diluted
+    ///   across silent frames scores low.
+    /// - `peak_speech_prob`: max per-frame `1 - P(blank)` — stays high for a
+    ///   brief word the mean washes out; the better gate for noise filtering.
     pub fn decode_with_probability(
         &self,
         enc_proj: &[f32],
         seq_len: usize,
         tokenizer: &Tokenizer,
-    ) -> (String, f32, f32) {
+    ) -> (String, f32, f32, f32) {
         let jh = self.joint_hidden;
         let ph = self.pred_hidden;
 
@@ -140,6 +198,15 @@ impl CpuRnntDecoder {
         let mut nonblank_mass_sum: f32 = 0.0;
         let mut frame_count: usize = 0;
 
+        let ad = self.anti_del; // Copy
+        let base_penalty = if seq_len <= ad.short_frames {
+            ad.blank_penalty + ad.short_extra_penalty
+        } else {
+            ad.blank_penalty
+        };
+        let mut best_margin = f32::NEG_INFINITY;
+        let mut peak_prob = 0.0f32;
+
         for t in 0..seq_len {
             let f_proj = &enc_proj[t * jh..(t + 1) * jh];
             let mut not_blank = true;
@@ -161,6 +228,17 @@ impl CpuRnntDecoder {
 
                 matvec_row(&self.out_w, &self.out_b, &combined, &mut logits, jh, self.num_classes);
                 softmax(&logits, &mut probs);
+                // anti-deletion: metrics (below) stay on RAW probs; bias only
+                // the argmax decision away from blank.
+                let margin = max_excluding(&logits, self.blank_id) - logits[self.blank_id];
+                if margin > best_margin {
+                    best_margin = margin;
+                }
+                let nb_prob = 1.0 - probs[self.blank_id];
+                if nb_prob > peak_prob {
+                    peak_prob = nb_prob;
+                }
+                logits[self.blank_id] -= base_penalty;
                 let k = argmax(&logits);
 
                 if !blank_recorded_this_frame {
@@ -194,7 +272,19 @@ impl CpuRnntDecoder {
         } else {
             0.0
         };
-        (text, token_confidence, speech_prob)
+
+        // Hard non-empty guarantee (short-audio number drops): blank swept the
+        // whole clip, but the peak non-blank probability reached
+        // `speech_prob_thresh` ⇒ real (quiet/short) speech ⇒ re-decode at a
+        // penalty large enough to flip the best frame. Forced tokens report
+        // confidence 0.0. (speech_prob, the per-frame mean, is left as measured.)
+        if ad.guarantee_nonempty && hyp.is_empty() && peak_prob >= ad.speech_prob_thresh {
+            let pen = ((-best_margin) + 0.5).max(base_penalty).min(ad.max_penalty);
+            let (hyp2, _, _) = self.greedy_pass(enc_proj, seq_len, tokenizer, pen, &mut |_, _| {});
+            return (tokenizer.decode(&hyp2), 0.0, speech_prob, peak_prob);
+        }
+
+        (text, token_confidence, speech_prob, peak_prob)
     }
 
     /// Like [`decode`], but calls `on_token(token_id, text_piece)` for each
@@ -222,6 +312,55 @@ impl CpuRnntDecoder {
     where
         F: FnMut(usize, &str),
     {
+        let ad = self.anti_del; // Copy
+        // Length-adaptive blank penalty: short clips (isolated numbers etc.)
+        // get an extra nudge away from all-blank / empty output.
+        let base = if seq_len <= ad.short_frames {
+            ad.blank_penalty + ad.short_extra_penalty
+        } else {
+            ad.blank_penalty
+        };
+
+        let (hyp, best_margin, peak_prob) =
+            self.greedy_pass(enc_proj, seq_len, tokenizer, base, &mut on_token);
+
+        // Hard non-empty guarantee: the greedy pass emitted nothing, but the
+        // peak per-frame non-blank probability reached `speech_prob_thresh` —
+        // real (quiet/short) speech, not silence. Re-decode at a blank penalty
+        // large enough to flip the best frame so an isolated number/word is
+        // never dropped. Genuine silence has near-zero non-blank probability, so
+        // it fails the gate and correctly stays empty. Because the first pass
+        // emitted nothing, no tokens were streamed, so replaying through
+        // `on_token` cannot double-emit.
+        if ad.guarantee_nonempty && hyp.is_empty() && peak_prob >= ad.speech_prob_thresh {
+            let pen = ((-best_margin) + 0.5).max(base).min(ad.max_penalty);
+            let (hyp2, _, _) =
+                self.greedy_pass(enc_proj, seq_len, tokenizer, pen, &mut on_token);
+            return tokenizer.decode(&hyp2);
+        }
+
+        tokenizer.decode(&hyp)
+    }
+
+    /// One greedy RNNT pass at a fixed `blank_penalty` (subtracted from the
+    /// blank logit before every `argmax`). Streams emitted tokens through
+    /// `on_token`. Returns `(emitted_ids, best_nonblank_margin, peak_nonblank_prob)`:
+    ///   * `best_nonblank_margin` = max over steps of
+    ///     `(max_nonblank_logit - blank_logit)` on the RAW logits — sizes the
+    ///     penalty needed to flip the best frame.
+    ///   * `peak_nonblank_prob` = max over steps of `(1 - softmax(logits)[blank])`
+    ///     on the RAW logits — the VAD signal that gates the non-empty guarantee.
+    fn greedy_pass<F>(
+        &self,
+        enc_proj: &[f32],
+        seq_len: usize,
+        tokenizer: &Tokenizer,
+        blank_penalty: f32,
+        on_token: &mut F,
+    ) -> (Vec<usize>, f32, f32)
+    where
+        F: FnMut(usize, &str),
+    {
         let jh = self.joint_hidden;
         let ph = self.pred_hidden;
 
@@ -237,6 +376,9 @@ impl CpuRnntDecoder {
         let mut pred_proj = vec![0.0f32; jh];
         let mut combined = vec![0.0f32; jh];
         let mut logits = vec![0.0f32; self.num_classes];
+
+        let mut best_margin = f32::NEG_INFINITY;
+        let mut peak_prob = 0.0f32;
 
         for t in 0..seq_len {
             let f_proj = &enc_proj[t * jh..(t + 1) * jh];
@@ -257,6 +399,21 @@ impl CpuRnntDecoder {
                 }
 
                 matvec_row(&self.out_w, &self.out_b, &combined, &mut logits, jh, self.num_classes);
+
+                // anti-deletion: measure speechiness on RAW logits (both the
+                // logit margin, for penalty sizing, and the softmax VAD prob,
+                // for the guarantee gate), then bias the blank class down.
+                let blank_logit = logits[self.blank_id];
+                let margin = max_excluding(&logits, self.blank_id) - blank_logit;
+                if margin > best_margin {
+                    best_margin = margin;
+                }
+                let nb_prob = nonblank_prob(&logits, self.blank_id);
+                if nb_prob > peak_prob {
+                    peak_prob = nb_prob;
+                }
+                logits[self.blank_id] = blank_logit - blank_penalty;
+
                 let k = argmax(&logits);
 
                 if k == self.blank_id {
@@ -275,7 +432,7 @@ impl CpuRnntDecoder {
             }
         }
 
-        tokenizer.decode(&hyp)
+        (hyp, best_margin, peak_prob)
     }
 
     /// Compute LSTM gates and produce h_new, c_new without mutating h/c.
@@ -400,6 +557,38 @@ fn matvec_row(w: &[f32], bias: &[f32], input: &[f32], out: &mut [f32], in_len: u
             out[j] += x * row[j];
         }
     }
+}
+
+/// Max value over `v` excluding index `skip` (used to measure how close the
+/// best non-blank class came to blank).
+#[inline]
+fn max_excluding(v: &[f32], skip: usize) -> f32 {
+    let mut best = f32::NEG_INFINITY;
+    for (i, &val) in v.iter().enumerate() {
+        if i != skip && val > best {
+            best = val;
+        }
+    }
+    best
+}
+
+/// `1 - softmax(logits)[blank_id]`, numerically stable — the per-frame
+/// probability that SOMETHING (a non-blank token) should be emitted here. Near
+/// 0 on silence, high on speech; the VAD signal that gates the non-empty guard.
+#[inline]
+fn nonblank_prob(logits: &[f32], blank_id: usize) -> f32 {
+    let mut mx = f32::NEG_INFINITY;
+    for &v in logits {
+        if v > mx {
+            mx = v;
+        }
+    }
+    let mut sum = 0.0f32;
+    for &v in logits {
+        sum += (v - mx).exp();
+    }
+    let p_blank = (logits[blank_id] - mx).exp() / sum;
+    1.0 - p_blank
 }
 
 #[inline]

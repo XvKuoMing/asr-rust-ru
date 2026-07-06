@@ -99,9 +99,13 @@ pub struct TranscriptionChunkResponse {
     /// Average softmax probability of the emitted (non-blank) tokens. 0.0 if
     /// nothing was emitted (likely silence).
     pub token_confidence: f32,
-    /// Mean `1 − P(blank)` over every encoder frame in this chunk. Use this
-    /// as a VAD signal — close to 0 on silence, close to 1 on speech.
+    /// Mean `1 − P(blank)` over every encoder frame in this chunk — a VAD
+    /// signal (≈0 on silence). NOTE: being a mean it under-reports short
+    /// speech; a lone spoken number diluted across silent frames scores low.
     pub speech_prob: f32,
+    /// Max per-frame `1 − P(blank)` in this chunk. Stays high for brief
+    /// speech the mean washes out — prefer this for noise filtering.
+    pub peak_speech_prob: f32,
     /// Length (in 16 kHz samples) of the audio buffer that produced `text`.
     pub samples: usize,
 }

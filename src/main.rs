@@ -452,6 +452,7 @@ struct WsTranscribe {
     text: String,
     token_confidence: f32,
     speech_prob: f32,
+    peak_speech_prob: f32,
     samples: usize,
     preprocess_ms: f64,
     queue_ms: f64,
@@ -472,6 +473,7 @@ async fn transcribe_buffer(
             text: String::new(),
             token_confidence: 0.0,
             speech_prob: 0.0,
+            peak_speech_prob: 0.0,
             samples: num_samples,
             preprocess_ms: 0.0,
             queue_ms: 0.0,
@@ -498,6 +500,7 @@ async fn transcribe_buffer(
             text: String::new(),
             token_confidence: 0.0,
             speech_prob: 0.0,
+            peak_speech_prob: 0.0,
             samples: num_samples,
             preprocess_ms,
             queue_ms: 0.0,
@@ -526,7 +529,7 @@ async fn transcribe_buffer(
 
     let state_clone = state_clone.clone();
     let t_dec = Instant::now();
-    let (text, token_conf, speech_prob) = web::block(move || {
+    let (text, token_conf, speech_prob, peak_speech_prob) = web::block(move || {
         state_clone.cpu_decoder.decode_with_probability(
             &enc.enc_proj,
             enc.seq_len,
@@ -541,6 +544,7 @@ async fn transcribe_buffer(
         text,
         token_confidence: token_conf,
         speech_prob,
+        peak_speech_prob,
         samples: num_samples,
         preprocess_ms,
         queue_ms: enc.queue_ms,
@@ -675,6 +679,7 @@ async fn transcribe_ws(
                         text: r.text,
                         token_confidence: r.token_confidence,
                         speech_prob: r.speech_prob,
+                        peak_speech_prob: r.peak_speech_prob,
                         samples: r.samples,
                     };
                     if session.text(serde_json::to_string(&resp).unwrap()).await.is_err() {
@@ -730,6 +735,7 @@ async fn transcribe_ws(
                         text: r.text,
                         token_confidence: r.token_confidence,
                         speech_prob: r.speech_prob,
+                        peak_speech_prob: r.peak_speech_prob,
                         samples: r.samples,
                     };
                     if session.text(serde_json::to_string(&resp).unwrap()).await.is_err() {
