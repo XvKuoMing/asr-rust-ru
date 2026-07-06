@@ -110,6 +110,11 @@ Multipart upload: `file` (any ffmpeg-supported audio), optional `model`, optiona
 `transcript.text.delta` / `transcript.text.done` events. Full reference in
 [API.md](API.md).
 
+A `model` name ending in **`-lmcorr`** (e.g. `gigaam-lmcorr`) runs the
+[embedded brand-correction LM](#brand-correction-lm) on the transcript; the
+response then carries the corrected `text` plus the uncorrected `raw_text`.
+Any other (or absent) model name transcribes without correction.
+
 ### `GET /v1/audio/transcriptions/ws` (WebSocket)
 
 Streaming, chunked transcription over WebSocket. Designed for browser/edge
@@ -142,6 +147,7 @@ Server → Client (text frame):
   "text": "привет мир",
   "token_confidence": 0.92,
   "speech_prob": 0.81,
+  "peak_speech_prob": 0.97,
   "samples": 12800
 }
 ```
@@ -150,9 +156,21 @@ Server → Client (text frame):
 |--------------------|------------------------------------------------------------------------|
 | `type`             | `"delta"` for a partial, `"final"` for the post-flush emission         |
 | `text`             | Transcript of the buffer so far                                        |
+| `raw_text`         | Uncorrected text; present on `final` frames when `?model=...-lmcorr`   |
 | `token_confidence` | Mean softmax probability of emitted (non-blank) tokens, `0` if none    |
-| `speech_prob`      | Mean `1 − P(blank)` over every encoder frame — use as a VAD score      |
+| `speech_prob`      | Mean `1 − P(blank)` over every encoder frame — a VAD score             |
+| `peak_speech_prob` | Max per-frame `1 − P(blank)` — prefer this for noise filtering         |
 | `samples`          | Length of the audio buffer (16 kHz samples) that produced `text`       |
+
+Add `&model=gigaam-lmcorr` to the URL query to brand-correct `final` frames
+(deltas always stream raw for latency).
+
+**Filtering background noise with the probability fields.** `speech_prob` is a
+*mean* over frames, so a chunk that is mostly silence with one short spoken word
+scores low — a high threshold will drop exactly the short answers you care
+about. Use `peak_speech_prob` (max over frames) as the primary gate, or simply
+treat an empty `text` as "no speech": with the anti-deletion decoder an empty
+transcript already means blank confidently won every frame.
 
 Errors come back as `{"type":"error","error":"..."}` text frames; the server
 keeps the socket open so the client can recover.
@@ -200,6 +218,40 @@ The companion **livellm-proxy** ships a `transcription_ws` client that talks
 this protocol with built-in VAD — see
 `~/qalby/livellm-proxy/audio_ai/livellm.py` and the proxy's README.
 
+## Brand correction (LM)
+
+An embedded fine-tuned **ruT5** rewrites brand names the ASR mis-heard
+(`вотоввос` → `Водовоз`, `сникерс` → `Snickers`, `аквариал` → `Аква Ареал`).
+It runs fully in-process on CPU via [candle](https://github.com/huggingface/candle)
+— no Python, no sidecar. A catalog acceptance filter keeps only edits that turn
+a phonetically-close span into a real catalog brand, so correction can never
+delete content or replace a genuine word.
+
+- **Opt-in per request**: model name ending in `-lmcorr` (multipart `model`
+  field on POST, `?model=` on the WebSocket). Without the suffix the LM is
+  bypassed entirely.
+- **Model directory** (`CORRECTOR_DIR`, default `corrector/`): a standard HF T5
+  export (`model.safetensors`, `config.json`, `tokenizer.json`) plus
+  `brands.txt` (one canonical brand per line). Assemble it with:
+
+```bash
+python scripts/prepare_corrector.py <trained_hf_dir> <brands.txt> corrector
+```
+
+If the directory is missing the service runs normally and `-lmcorr` requests
+get HTTP 400.
+
+## Short-audio anti-deletion
+
+RNNT greedy decoding collapses to the empty string when the blank class wins
+every encoder frame — short clips whose only content is a number were silently
+dropped. The decoder now applies a length-adaptive blank penalty on short clips
+and, when a first pass emits nothing but the peak per-frame non-blank
+probability says the clip contains speech, re-decodes with a penalty large
+enough to emit. True silence still decodes to empty. Tunables live in
+`decoding::AntiDeletion` (see `src/decoding.rs`); defaults are active out of
+the box and are a no-op on normal-length audio.
+
 ## Project structure
 
 ```
@@ -210,11 +262,13 @@ src/
 │   ├── mod.rs        # GigaAMASR top-level model, weight loading + key remapping
 │   ├── encoder.rs    # Conformer encoder (subsampling, RoPE, attention, conv, FFN)
 │   └── decoder.rs    # RNNT head (LSTM cell, prediction network, joint network)
-├── decoding.rs       # CPU RNNT greedy decoder, SentencePiece tokenizer, batched projection
+├── decoding.rs       # CPU RNNT greedy decoder (+ anti-deletion), SentencePiece tokenizer
+├── corrector.rs      # Embedded T5 brand-correction LM (candle) + catalog filter
 └── schemas.rs        # Shared type definitions
 scripts/
-├── convert_model.py  # Download GigaAM checkpoint + convert to safetensors
-└── pyproject.toml    # Python dependencies for conversion
+├── convert_model.py      # Download GigaAM checkpoint + convert to safetensors
+├── prepare_corrector.py  # Assemble the corrector model dir (CORRECTOR_DIR)
+└── pyproject.toml        # Python dependencies for conversion
 ```
 
 ## Configuration

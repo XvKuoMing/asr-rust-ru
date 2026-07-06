@@ -10,6 +10,7 @@ Complete reference for all public modules, structs, and functions.
   - [`audio`](#audio)
   - [`model`](#model)
   - [`decoding`](#decoding)
+  - [`corrector`](#corrector)
 - [Concurrency & batching](#concurrency--batching)
 - [Thread safety](#thread-safety)
 - [Integration example](#integration-example)
@@ -291,6 +292,37 @@ then splits into per-sequence CPU data.
 | `encoded`     | `&Tensor<B, 3>` | `[B, d_model, T']` | Batched encoder output   |
 | `encoded_len` | `&Tensor<B, 1>` | `[B]`              | Per-sequence lengths     |
 | **returns**   | `Vec<(Vec<f32>, usize)>` | —          | Per-sequence projections |
+
+#### `decoding::AntiDeletion`
+
+Anti-deletion knobs for greedy decoding (short-audio number drops). Installed
+with sane defaults by `CpuRnntDecoder::from_model`; override via
+`set_anti_deletion`. Fields: `blank_penalty` (all clips), `short_frames` /
+`short_extra_penalty` (length-adaptive penalty for clips ≤ N encoder frames),
+`guarantee_nonempty` + `speech_prob_thresh` (VAD-gated re-decode when a pass
+emits nothing but peak per-frame `1 − P(blank)` says the clip has speech),
+`max_penalty` (cap for the re-decode). True silence still decodes to empty.
+
+### `corrector`
+
+Embedded brand-correction LM: a fine-tuned ruT5 (T5-base) running in-process on
+CPU via candle, plus a catalog acceptance filter. Only edits that turn a
+phonetically-close span into a real catalog brand are kept; deletions,
+insertions and free-form rewrites are reverted, so correction never loses
+content. Enabled per request by a `-lmcorr` model-name suffix.
+
+#### `Corrector::load(dir: &str) -> Result<Corrector, String>`
+
+Loads `model.safetensors`, `config.json`, `tokenizer.json` and `brands.txt`
+from `dir` (see `scripts/prepare_corrector.py`). Called once at startup when
+`CORRECTOR_DIR` exists.
+
+#### `Corrector::correct(&mut self, text: &str) -> String`
+
+Greedy T5 generation (`"исправь: "` task prefix, kv-cached) followed by the
+acceptance filter. `&mut` because generation mutates the kv-cache — the server
+wraps the corrector in a `Mutex` and calls it from blocking threads. On any
+generation error the raw text is returned unchanged.
 
 ---
 
