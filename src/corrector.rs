@@ -38,6 +38,10 @@ pub struct Corrector {
     /// Space-stripped catalog keys (plus Cyrillic transliterations of Latin
     /// brands), grouped by char length — the pre-filter screen.
     screen: Vec<Vec<String>>,
+    /// Corpus-frequent words (optional `common_words.txt`). Garbled brands are
+    /// non-words, so a span made of known real words is skipped as a candidate
+    /// unless it is nearly an exact brand match.
+    common: std::collections::HashSet<String>,
 }
 
 impl Corrector {
@@ -86,6 +90,32 @@ impl Corrector {
             return Err(format!("{dir}/brands.txt contains no usable brands"));
         }
         let screen = build_screen(&catalog);
+        let common: std::collections::HashSet<String> =
+            std::fs::read_to_string(format!("{dir}/common_words.txt"))
+                .map(|d| {
+                    d.lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+        let mut common = common;
+        if !common.is_empty() {
+            // catalog brand words are real words too — a span is a garble
+            // candidate only if it contains at least one UNKNOWN word
+            for (n, _) in &catalog {
+                for w in n.split_whitespace() {
+                    common.insert(w.to_string());
+                }
+            }
+        }
+        if common.is_empty() {
+            log::warn!(
+                "no {dir}/common_words.txt — the candidate screen will fire on \
+                 ordinary words and correction windows will be larger/slower"
+            );
+        }
 
         Ok(Self {
             eos_token_id: config.eos_token_id as u32,
@@ -97,6 +127,7 @@ impl Corrector {
             device,
             catalog,
             screen,
+            common,
         })
     }
 
@@ -145,7 +176,16 @@ impl Corrector {
                     }
                 }
                 if let Some(r) = best {
-                    spans.push((i, i + n, r));
+                    // ratio 0 = span already IS the brand: nothing to fix.
+                    // A span made entirely of corpus-known real words is not a
+                    // garble (garbles are non-words) unless it is nearly exact.
+                    let all_common = !self.common.is_empty()
+                        && win.iter().all(|w| {
+                            w.chars().count() < 3 || self.common.contains(w.as_str())
+                        });
+                    if r > 0.0 && !all_common {
+                        spans.push((i, i + n, r));
+                    }
                 }
             }
         }

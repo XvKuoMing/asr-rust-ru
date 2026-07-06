@@ -235,8 +235,15 @@ delete content or replace a genuine word.
   `brands.txt` (one canonical brand per line). Assemble it with:
 
 ```bash
-python scripts/prepare_corrector.py <trained_hf_dir> <brands.txt> corrector
+python scripts/prepare_corrector.py <trained_hf_dir> <brands.txt> corrector [common_words.txt]
 ```
+
+`common_words.txt` (optional, recommended) lists corpus-frequent words from
+your own transcripts; the candidate screen treats them as real words and only
+windows spans containing an *unknown* word — garbled brands are non-words.
+Without it the screen fires on ordinary words and correction is slower.
+To run the server with your own fine-tuned ASR checkpoint instead of the CDN
+download, convert it with `scripts/convert_finetuned.py <ckpt> <tokenizer.model>`.
 
 If the directory is missing the service runs normally and `-lmcorr` requests
 get HTTP 400.
