@@ -21,11 +21,17 @@ RUN wget -q -O /tmp/libtorch.zip \
     && rm /tmp/libtorch.zip
 
 # ---------------------------------------------------------------------------
-# Stage 3 — Build the Rust binary against the pre-downloaded LibTorch
+# Stage 3 — Build the Rust binary against the pre-downloaded LibTorch.
+# CUDA devel base provides nvcc for the corrector's GPU kernels
+# (--features corrector-cuda); the runtime stage ships the matching libs.
 # ---------------------------------------------------------------------------
-FROM rust:slim-bookworm AS builder
-RUN apt-get update && apt-get install -y --no-install-recommends pkg-config g++ curl \
+FROM nvidia/cuda:12.8.0-devel-ubuntu24.04 AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config g++ curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal
+ENV PATH=/root/.cargo/bin:$PATH
 
 COPY --from=libtorch /opt/libtorch /opt/libtorch
 ENV LIBTORCH=/opt/libtorch
@@ -35,7 +41,8 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY benches/ benches/
-RUN cargo build --release
+COPY examples/ examples/
+RUN cargo build --release --features corrector-cuda
 
 # ---------------------------------------------------------------------------
 # Stage 4 — Minimal runtime image

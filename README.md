@@ -241,6 +241,25 @@ python scripts/prepare_corrector.py <trained_hf_dir> <brands.txt> corrector
 If the directory is missing the service runs normally and `-lmcorr` requests
 get HTTP 400.
 
+**Performance.** Correction is *windowed*: a cheap phonetic screen locates
+brand-candidate spans, and only a small window around the best-ranked spans
+(max 2) goes through T5 — latency scales with the window, not the sentence.
+Texts with nothing brand-like skip the LM entirely (<1 ms). Measured with
+`cargo run --release --features corrector-cuda --example corrector_demo`
+(ruT5-base, RTX 5090, WSL2 — native Linux is faster per kernel launch):
+
+| path | latency |
+|---|---|
+| pre-filter skip (no brand-like span) | < 1 ms |
+| one correction window (GPU, bf16) | ~110–170 ms |
+| two windows (worst case, GPU) | ~200–290 ms |
+| CPU fallback (no `corrector-cuda`) | ~2 s |
+
+Quality is unchanged by windowing (61.3% vs 61.5% brand-fix on the synthetic
+test, 0.5% false positives, general WER 11.21→11.19). The Docker image builds
+with `corrector-cuda` by default; for a local GPU build you need `nvcc` (CUDA
+12.8+ for Blackwell/sm_120).
+
 ## Short-audio anti-deletion
 
 RNNT greedy decoding collapses to the empty string when the blank class wins

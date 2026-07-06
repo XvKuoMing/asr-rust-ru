@@ -6,6 +6,8 @@ edition = "2021"
 [features]
 default = []
 flash-attn = ["burn_attention"]
+# run the brand-corrector T5 on GPU (needs nvcc at build time)
+corrector-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 
 [dependencies]
 burn = { version = "0.20.1", features = ["tch"] }

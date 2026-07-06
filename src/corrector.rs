@@ -35,6 +35,9 @@ pub struct Corrector {
     decoder_start_token_id: u32,
     /// (normalized, canonical-cased) brand phrases, longest-normalized first.
     catalog: Vec<(String, String)>,
+    /// Space-stripped catalog keys (plus Cyrillic transliterations of Latin
+    /// brands), grouped by char length — the pre-filter screen.
+    screen: Vec<Vec<String>>,
 }
 
 impl Corrector {
@@ -47,15 +50,31 @@ impl Corrector {
             serde_json::from_str(&cfg_raw).map_err(|e| format!("parse config.json: {e}"))?;
         config.use_cache = true; // kv-cache greedy decode
 
-        let device = Device::Cpu;
+        // GPU when built with the `corrector-cuda` feature (falls back to CPU
+        // if no device is present); plain CPU otherwise.
+        let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
+        log::info!(
+            "corrector device: {}",
+            if device.is_cuda() { "cuda:0" } else { "cpu" }
+        );
+        // bf16 on GPU halves memory traffic per decode step (greedy argmax is
+        // insensitive to the precision loss); f32 on CPU (no native bf16).
+        let dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(
                 &[format!("{dir}/model.safetensors")],
-                DType::F32,
+                dtype,
                 &device,
             )
             .map_err(|e| format!("load model.safetensors: {e}"))?
         };
+        // Some exports carry a separately-trained lm_head while the config
+        // still claims tied embeddings (HF silently unties in that case; if we
+        // honored the config the logits would come from the wrong matrix).
+        if config.tie_word_embeddings && vb.contains_tensor("lm_head.weight") {
+            log::info!("corrector: untying word embeddings (checkpoint has its own lm_head)");
+            config.tie_word_embeddings = false;
+        }
         let model = t5::T5ForConditionalGeneration::load(vb, &config)
             .map_err(|e| format!("build T5: {e}"))?;
 
@@ -66,6 +85,7 @@ impl Corrector {
         if catalog.is_empty() {
             return Err(format!("{dir}/brands.txt contains no usable brands"));
         }
+        let screen = build_screen(&catalog);
 
         Ok(Self {
             eos_token_id: config.eos_token_id as u32,
@@ -76,26 +96,132 @@ impl Corrector {
             tokenizer,
             device,
             catalog,
+            screen,
         })
+    }
+
+    /// Pre-filter: does `text` contain any span phonetically close to a
+    /// catalog brand? Texts with nothing brand-like skip T5 generation
+    /// entirely (micro- vs multi-hundred-ms latency).
+    pub fn has_brand_candidate(&self, text: &str) -> bool {
+        let words: Vec<String> = normalize(text)
+            .split_whitespace()
+            .map(|w| w.to_string())
+            .collect();
+        !self.candidate_spans(&words).is_empty()
+    }
+
+    /// Candidate spans `(start, end, ratio)` — word-index ranges (1–4 adjacent
+    /// words, spaces stripped) within the acceptance filter's distance of a
+    /// catalog brand, with the best relative edit distance found (`d / len`).
+    /// The bound is exactly the acceptance bound, so no span the constraint
+    /// could later accept is ever missed; `ratio` ranks how garble-like a span
+    /// is (true garbles score low, borderline screen fires near `REL_DIST`).
+    fn candidate_spans(&self, words: &[String]) -> Vec<(usize, usize, f32)> {
+        let mut spans: Vec<(usize, usize, f32)> = Vec::new();
+        for n in 1..=4usize {
+            for (i, win) in words.windows(n).enumerate() {
+                let span: String = win.concat();
+                let sl = span.chars().count();
+                if sl < 3 {
+                    continue;
+                }
+                // screen keys are grouped by length; a key of length L is
+                // reachable only if |L - sl| <= limit(L) — scan the buckets
+                // that can possibly match.
+                let mut best: Option<f32> = None;
+                for (len, bucket) in self.screen.iter().enumerate() {
+                    let limit = screen_limit(len);
+                    if len == 0 || len.abs_diff(sl) > limit {
+                        continue;
+                    }
+                    for key in bucket {
+                        if levenshtein_within(&span, key, limit) {
+                            let ratio = levenshtein(&span, key) as f32 / len as f32;
+                            if best.map(|b| ratio < b).unwrap_or(true) {
+                                best = Some(ratio);
+                            }
+                        }
+                    }
+                }
+                if let Some(r) = best {
+                    spans.push((i, i + n, r));
+                }
+            }
+        }
+        spans
     }
 
     pub fn catalog_len(&self) -> usize {
         self.catalog.len()
     }
 
-    /// Correct `text`: LM proposal + catalog acceptance filter.
-    /// On any generation error the raw text is returned unchanged.
+    /// Correct `text`: brand-candidate pre-filter, then WINDOWED LM correction.
+    ///
+    /// Instead of regenerating the whole sentence, only a ±`WINDOW_CONTEXT`-word
+    /// window around each candidate span is passed through T5 — latency scales
+    /// with the window (~10 words), not the sentence. Corrected windows are
+    /// spliced back; the acceptance filter runs per window, so anything except
+    /// a close-garble→catalog-brand edit is reverted exactly as before.
+    /// Texts with nothing brand-like return immediately. On any generation
+    /// error the raw text is returned unchanged.
     pub fn correct(&mut self, text: &str) -> String {
+        const WINDOW_CONTEXT: usize = 1; // words of context on each side
+        const MERGE_GAP: usize = 3; // merge windows closer than this
+        const MAX_WINDOWS: usize = 2; // best-ranked windows processed per text
+
         if text.trim().is_empty() {
             return text.to_string();
         }
-        match self.generate(text) {
-            Ok(proposal) => constrained_apply(text, &proposal, &self.catalog),
-            Err(e) => {
-                log::warn!("corrector generation failed ({e}); returning raw text");
-                text.to_string()
+        let raw_words: Vec<&str> = text.split_whitespace().collect();
+        let norm_words: Vec<String> = raw_words.iter().map(|w| normalize(w)).collect();
+        let spans = self.candidate_spans(&norm_words);
+        if spans.is_empty() {
+            return text.to_string();
+        }
+
+        // merge candidate spans into padded windows, tracking the best
+        // (lowest) distance ratio inside each window
+        let mut windows: Vec<(usize, usize, f32)> = Vec::new();
+        let mut sorted = spans;
+        sorted.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        for (s, e, r) in sorted {
+            let ws = s.saturating_sub(WINDOW_CONTEXT);
+            let we = (e + WINDOW_CONTEXT).min(raw_words.len());
+            match windows.last_mut() {
+                Some((_, le, lr)) if ws <= *le + MERGE_GAP => {
+                    *le = (*le).max(we);
+                    *lr = lr.min(r);
+                }
+                _ => windows.push((ws, we, r)),
             }
         }
+
+        // latency budget: process only the most garble-like windows (true
+        // garbles rank near 0.2–0.3; borderline screen fires near REL_DIST)
+        if windows.len() > MAX_WINDOWS {
+            windows.sort_unstable_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+            windows.truncate(MAX_WINDOWS);
+        }
+        windows.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+
+        let mut out: Vec<String> = raw_words.iter().map(|w| w.to_string()).collect();
+        // right-to-left so earlier indices stay valid while splicing
+        for (ws, we, _) in windows.into_iter().rev() {
+            let window_raw = raw_words[ws..we].join(" ");
+            match self.generate(&window_raw) {
+                Ok(p) => {
+                    let corrected = constrained_apply(&window_raw, &p, &self.catalog);
+                    if corrected != window_raw {
+                        out.splice(ws..we, corrected.split_whitespace().map(String::from));
+                    }
+                }
+                Err(e) => {
+                    log::warn!("corrector generation failed ({e}); keeping raw window");
+                }
+            }
+        }
+        out.join(" ")
     }
 
     /// Greedy seq2seq generation of the LM proposal.
@@ -114,8 +240,10 @@ impl Corrector {
             .encode(&input_ids)
             .map_err(|e| format!("encode: {e}"))?;
 
+        // a correction is ≈ the input length; the margin absorbs split brands
+        let max_new = (enc.get_ids().len() + 16).min(MAX_NEW_TOKENS);
         let mut output_ids: Vec<u32> = vec![self.decoder_start_token_id];
-        for step in 0..MAX_NEW_TOKENS {
+        for step in 0..max_new {
             let decoder_input = if step == 0 {
                 Tensor::new(output_ids.as_slice(), &self.device)
             } else {
@@ -204,6 +332,75 @@ fn normalize(text: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+/// Pre-filter distance bound for a screen key of length `len` — exactly the
+/// acceptance filter's `REL_DIST` bound: any span the constraint could later
+/// accept is within it, and anything looser only costs false positives (texts
+/// that pay for T5 generation and then have every edit rejected anyway).
+fn screen_limit(len: usize) -> usize {
+    ((REL_DIST * len as f32).round() as usize).max(1)
+}
+
+/// Space-stripped catalog keys (plus Cyrillic transliterations of Latin
+/// brands), grouped into buckets by char length for cheap length gating.
+fn build_screen(catalog: &[(String, String)]) -> Vec<Vec<String>> {
+    let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (n, _) in catalog {
+        let joined: String = n.chars().filter(|c| *c != ' ').collect();
+        if joined.chars().any(|c| c.is_ascii_lowercase()) {
+            keys.insert(translit_to_cyrillic(&joined));
+        }
+        keys.insert(joined);
+    }
+    let max_len = keys.iter().map(|k| k.chars().count()).max().unwrap_or(0);
+    let mut buckets = vec![Vec::new(); max_len + 1];
+    for k in keys {
+        let l = k.chars().count();
+        buckets[l].push(k);
+    }
+    buckets
+}
+
+/// Is `levenshtein(a, b) <= limit`? Banded DP with early exit — O(len·limit)
+/// instead of O(len²), and bails as soon as the whole band exceeds `limit`.
+fn levenshtein_within(a: &str, b: &str, limit: usize) -> bool {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.len().abs_diff(b.len()) > limit {
+        return false;
+    }
+    let big = limit + 1;
+    let mut prev: Vec<usize> = (0..=b.len()).map(|j| j.min(big)).collect();
+    let mut cur = vec![big; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = (i + 1).min(big);
+        let lo = (i + 1).saturating_sub(limit).max(1);
+        let hi = (i + 1 + limit).min(b.len());
+        let mut row_min = cur[0];
+        for j in lo..=hi {
+            let cost = usize::from(*ca != b[j - 1]);
+            let v = (prev[j - 1] + cost)
+                .min(prev[j] + 1)
+                .min(cur[j - 1] + 1)
+                .min(big);
+            cur[j] = v;
+            if v < row_min {
+                row_min = v;
+            }
+        }
+        if lo > 1 {
+            cur[lo - 1] = big;
+        }
+        if row_min > limit {
+            return false;
+        }
+        std::mem::swap(&mut prev, &mut cur);
+        for v in cur.iter_mut() {
+            *v = big;
+        }
+    }
+    prev[b.len()] <= limit
 }
 
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -464,5 +661,59 @@ mod tests {
             &cat(),
         );
         assert_eq!(out, "добрый день компания");
+    }
+
+    #[test]
+    fn banded_levenshtein_matches_full() {
+        let words = ["", "а", "водовоз", "вотовос", "сникерс", "snickers",
+                     "аквариал", "акваареал", "мама", "рама"];
+        for a in words {
+            for b in words {
+                let d = levenshtein(a, b);
+                for limit in 0..6 {
+                    assert_eq!(
+                        levenshtein_within(a, b, limit),
+                        d <= limit,
+                        "a={a} b={b} limit={limit} d={d}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn screen_finds_garbles_and_skips_plain_text() {
+        let screen = build_screen(&cat());
+        let c = |text: &str| {
+            // standalone screen check mirroring has_brand_candidate
+            let words: Vec<String> =
+                normalize(text).split_whitespace().map(|w| w.to_string()).collect();
+            for n in 1..=4usize {
+                for win in words.windows(n) {
+                    let span: String = win.concat();
+                    if span.chars().count() < 3 {
+                        continue;
+                    }
+                    let sl = span.chars().count();
+                    for (len, bucket) in screen.iter().enumerate() {
+                        let limit = screen_limit(len);
+                        if len.abs_diff(sl) > limit {
+                            continue;
+                        }
+                        for key in bucket {
+                            if levenshtein_within(&span, key, limit) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        };
+        assert!(c("компания Вотовос слушает"));          // garbled brand
+        assert!(c("один сникерс пожалуйста"));            // translit of Latin brand
+        assert!(c("добавьте аква ареал в заказ"));        // exact multiword brand
+        assert!(!c("да хорошо спасибо до свидания"));     // nothing brand-like
+        assert!(!c("привезите завтра к девяти утра"));    // nothing brand-like
     }
 }

@@ -658,6 +658,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bindgen_cuda"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "282be55fb326843bb67cccceeeaf21c961ef303f60018f9a2ab69494dad8eaf9"
+dependencies = [
+ "glob",
+ "num_cpus",
+ "rayon",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1855,6 +1866,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a9f51e2ecf6efe9737af8f993433c839f956d2b6ed4fd2dd4a7c6d8b0fa667ff"
 dependencies = [
  "byteorder",
+ "candle-kernels",
+ "cudarc 0.16.6",
  "gemm 0.17.1",
  "half",
  "memmap2",
@@ -1866,8 +1879,18 @@ dependencies = [
  "safetensors 0.4.5",
  "thiserror 1.0.69",
  "ug",
+ "ug-cuda",
  "yoke 0.7.5",
  "zip 1.1.4",
+]
+
+[[package]]
+name = "candle-kernels"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8455f84bd810047c7c41216683c1020c915a9f8a740b3b0eabdd4fb2fbaa660"
+dependencies = [
+ "bindgen_cuda",
 ]
 
 [[package]]
@@ -3156,6 +3179,16 @@ dependencies = [
  "num-traits",
  "serde",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "cudarc"
+version = "0.16.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17200eb07e7d85a243aa1bf4569a7aa998385ba98d14833973a817a63cc86e92"
+dependencies = [
+ "half",
+ "libloading",
 ]
 
 [[package]]
@@ -8218,6 +8251,19 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "yoke 0.7.5",
+]
+
+[[package]]
+name = "ug-cuda"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14053653d0b7fa7b21015aa9a62edc8af2f60aa6f9c54e66386ecce55f22ed29"
+dependencies = [
+ "cudarc 0.16.6",
+ "half",
+ "serde",
+ "thiserror 1.0.69",
+ "ug",
 ]
 
 [[package]]
