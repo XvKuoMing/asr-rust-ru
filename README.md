@@ -101,9 +101,13 @@ LD_LIBRARY_PATH="$LIB_DIR" ./target/release/asr-rust 8 10 example.wav
 Build and run with full GPU support:
 
 ```bash
-docker build -t asr-rust .
+docker build -t asr-rust --build-arg CUDA_COMPUTE_CAP=120 .   # your GPU's cc: 5090=120, 4090=89, 3090=86
 docker run --gpus all asr-rust
 ```
+
+(`docker build` has no GPU access, so the corrector's CUDA kernels need the
+compute capability passed explicitly; with compose set `CUDA_COMPUTE_CAP` in
+`.env` — default is 120.)
 
 The multi-stage Dockerfile handles everything: weight conversion, LibTorch
 download, Rust compilation, and produces a minimal runtime image.

@@ -1,6 +1,11 @@
 services:
   asr:
-    build: .
+    platform: linux/amd64
+    build:
+      context: .
+      args:
+        # your GPU's compute capability (5090: 120, 4090: 89, 3090: 86)
+        CUDA_COMPUTE_CAP: ${CUDA_COMPUTE_CAP:-120}
     image: kamasalyamov/asr-rust:1.0.1
     env_file:
       - .env

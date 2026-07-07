@@ -49,6 +49,11 @@ COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY benches/ benches/
 COPY examples/ examples/
+# docker build has no GPU, so the corrector's CUDA kernels can't auto-detect
+# the compute capability via nvidia-smi — set it for your card:
+#   RTX 5090: 120 | RTX 4090: 89 | RTX 3090/A5000/A6000: 86 | A100: 80 | T4: 75
+ARG CUDA_COMPUTE_CAP=120
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
 RUN cargo build --release --features corrector-cuda
 
 # ---------------------------------------------------------------------------
