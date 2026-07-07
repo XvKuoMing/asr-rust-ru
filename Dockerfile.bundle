@@ -1,0 +1,6 @@
+# Bundle variant: 1.0.1 server + fine-tuned ASR weights + brand-corrector LM.
+# Build from a staging dir containing weights/ (scripts/convert_finetuned.py
+# output) and corrector/ (scripts/prepare_corrector.py output).
+FROM kamasalyamov/asr-rust:1.0.1
+COPY weights/ /app/weights/
+COPY corrector/ /app/corrector/

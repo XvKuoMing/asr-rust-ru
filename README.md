@@ -109,6 +109,10 @@ docker run --gpus all asr-rust
 compute capability passed explicitly; with compose set `CUDA_COMPUTE_CAP` in
 `.env` — default is 120.)
 
+To publish a self-contained image with the fine-tuned weights and the brand
+corrector baked in, stage a dir with `weights/` + `corrector/` next to
+`Dockerfile.bundle` and build it on top of the base tag (see that file).
+
 The multi-stage Dockerfile handles everything: weight conversion, LibTorch
 download, Rust compilation, and produces a minimal runtime image.
 
