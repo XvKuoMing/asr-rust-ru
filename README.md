@@ -261,6 +261,10 @@ python scripts/prepare_corrector.py <trained_hf_dir> <brands.txt> corrector [com
 your own transcripts; the candidate screen treats them as real words and only
 windows spans containing an *unknown* word — garbled brands are non-words.
 Without it the screen fires on ordinary words and correction is slower.
+`ambiguous_words.txt` (optional, curated `word -> Brand` lines) handles real
+words the ASR emits when a brand was spoken (`аквариум` ~ `Аква Ареал`): they
+are windowed with wide context and the LM decides from the phrasing — order
+talk becomes the brand, quote/label contexts keep the word.
 To run the server with your own fine-tuned ASR checkpoint instead of the CDN
 download, convert it with `scripts/convert_finetuned.py <ckpt> <tokenizer.model>`.
 

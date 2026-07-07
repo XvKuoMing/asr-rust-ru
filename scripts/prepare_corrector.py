@@ -2,7 +2,7 @@
 """Assemble the corrector model directory the server loads (CORRECTOR_DIR).
 
 Usage:
-    python prepare_corrector.py <trained_hf_dir> <brands_catalog.txt> [out_dir] [common_words.txt]
+    python prepare_corrector.py <trained_hf_dir> <brands_catalog.txt> [out_dir] [common_words.txt] [ambiguous_words.txt]
 
 <trained_hf_dir>  fine-tuned T5 corrector export (from the training repo, e.g.
                   checkpoints/brand_corrector_v2): model.safetensors,
@@ -28,6 +28,7 @@ def main():
     brands = Path(sys.argv[2])
     out = Path(sys.argv[3] if len(sys.argv) > 3 else "corrector")
     common = Path(sys.argv[4]) if len(sys.argv) > 4 else None
+    ambiguous = Path(sys.argv[5]) if len(sys.argv) > 5 else None
 
     missing = [f for f in REQUIRED if not (src / f).exists()]
     if missing:
@@ -41,6 +42,8 @@ def main():
     shutil.copy2(brands, out / "brands.txt")
     if common is not None and common.exists():
         shutil.copy2(common, out / "common_words.txt")
+    if ambiguous is not None and ambiguous.exists():
+        shutil.copy2(ambiguous, out / "ambiguous_words.txt")
     print(f"corrector dir ready: {out.resolve()}")
     for p in sorted(out.iterdir()):
         print(f"  {p.name:28s} {p.stat().st_size:>12,} B")

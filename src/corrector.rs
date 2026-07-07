@@ -42,6 +42,10 @@ pub struct Corrector {
     /// non-words, so a span made of known real words is skipped as a candidate
     /// unless it is nearly an exact brand match.
     common: std::collections::HashSet<String>,
+    /// Curated ambiguous words (optional `ambiguous_words.txt`): real words the
+    /// ASR emits when a brand was spoken (аквариум ~ Аква Ареал). These ARE
+    /// windowed — with wide context, so the LM can decide from the phrasing.
+    ambiguous: std::collections::HashSet<String>,
 }
 
 impl Corrector {
@@ -116,6 +120,21 @@ impl Corrector {
                  ordinary words and correction windows will be larger/slower"
             );
         }
+        // "word -> Brand" lines; only the word side matters for the screen
+        // (the LM + catalog filter produce/validate the brand).
+        let ambiguous: std::collections::HashSet<String> =
+            std::fs::read_to_string(format!("{dir}/ambiguous_words.txt"))
+                .map(|d| {
+                    d.lines()
+                        .filter_map(|l| l.trim().split(" -> ").next())
+                        .filter(|w| !w.is_empty() && !w.starts_with('#'))
+                        .map(normalize)
+                        .collect()
+                })
+                .unwrap_or_default();
+        if !ambiguous.is_empty() {
+            log::info!("corrector: {} curated ambiguous words", ambiguous.len());
+        }
 
         Ok(Self {
             eos_token_id: config.eos_token_id as u32,
@@ -128,6 +147,7 @@ impl Corrector {
             catalog,
             screen,
             common,
+            ambiguous,
         })
     }
 
@@ -179,11 +199,13 @@ impl Corrector {
                     // ratio 0 = span already IS the brand: nothing to fix.
                     // A span made entirely of corpus-known real words is not a
                     // garble (garbles are non-words) unless it is nearly exact.
+                    let has_ambiguous =
+                        win.iter().any(|w| self.ambiguous.contains(w.as_str()));
                     let all_common = !self.common.is_empty()
                         && win.iter().all(|w| {
                             w.chars().count() < 3 || self.common.contains(w.as_str())
                         });
-                    if r > 0.0 && !all_common {
+                    if r > 0.0 && (has_ambiguous || !all_common) {
                         spans.push((i, i + n, r));
                     }
                 }
@@ -221,13 +243,23 @@ impl Corrector {
         }
 
         // merge candidate spans into padded windows, tracking the best
-        // (lowest) distance ratio inside each window
+        // (lowest) distance ratio inside each window. Ambiguous words get wide
+        // context: the surrounding phrasing is what disambiguates them.
+        const AMBIGUOUS_CONTEXT: usize = 4;
         let mut windows: Vec<(usize, usize, f32)> = Vec::new();
         let mut sorted = spans;
         sorted.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
         for (s, e, r) in sorted {
-            let ws = s.saturating_sub(WINDOW_CONTEXT);
-            let we = (e + WINDOW_CONTEXT).min(raw_words.len());
+            let ctx = if norm_words[s..e]
+                .iter()
+                .any(|w| self.ambiguous.contains(w.as_str()))
+            {
+                AMBIGUOUS_CONTEXT
+            } else {
+                WINDOW_CONTEXT
+            };
+            let ws = s.saturating_sub(ctx);
+            let we = (e + ctx).min(raw_words.len());
             match windows.last_mut() {
                 Some((_, le, lr)) if ws <= *le + MERGE_GAP => {
                     *le = (*le).max(we);
