@@ -2,11 +2,18 @@
 # Stage 1 — Convert PyTorch checkpoint → safetensors + tokenizer
 # ---------------------------------------------------------------------------
 FROM python:3.12-slim AS converter
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+# pinned: 'latest' uv against an older uv.lock revision breaks `uv sync --locked`
+COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /uvx /bin/
 
 WORKDIR /app
 COPY scripts/ scripts/
-RUN cd scripts && uv sync --locked && uv run python convert_model.py
+# The checkpoint download needs the Sber CDN (geo-blocked in some regions).
+# Don't fail the whole image over it: ship without baked weights and mount a
+# locally-converted weights/ dir at runtime instead (see compose.yaml).
+RUN mkdir -p /app/weights && ( cd scripts && uv sync --locked \
+    && uv run python convert_model.py ) \
+    || echo "WARNING: weight conversion failed (CDN unreachable?). Image has no \
+baked weights - mount your converted weights/ into /app/weights at runtime."
 # weights/ is created at /app/weights/
 
 # ---------------------------------------------------------------------------

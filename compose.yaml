@@ -15,6 +15,9 @@ services:
       # Brand-corrector LM (optional). Build it with scripts/prepare_corrector.py;
       # without it the service runs fine and '-lmcorr' requests are rejected.
       - ${CORRECTOR_HOST_DIR:-./corrector}:/app/corrector:ro
+      # Uncomment if the image was built without baked weights (geo-blocked CDN)
+      # or to serve your own fine-tuned model (scripts/convert_finetuned.py):
+      # - ${WEIGHTS_HOST_DIR:-./weights}:/app/weights:ro
     ports:
       - "${PORT:-8080}:${PORT:-8080}"
     restart: unless-stopped
